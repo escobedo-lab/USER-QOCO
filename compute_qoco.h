@@ -18,9 +18,11 @@ namespace LAMMPS_NS {
 
 class ComputeQOCO : public Compute {
  public:
-  char *idrigid, *m_prop;              			// fields accessed by other classes
+  char *idrigid, *init_name;								// Accessed by other classes
+	int init_style, init_cols;
+	std::string init_str;
   double *alpha, **aor, *thetac, **dquat;
-	int *m_id, iprop, *molid, *countid, m_max, *map_bucket;
+	int *m_id, *molid, *map_bucket, m_max;
 	int qoco_num;															// Number of springs
 	int firstflag;														// If compute called the first time
 																						// Generate map-bucket array only on the first pass
@@ -52,9 +54,7 @@ class ComputeQOCO : public Compute {
 	// Works in conjunction with fix qrigid
 	class FixQRigid *fixrigid;
 
-  tagint *maxbead, *bead_axes;
-	int *molone, *countone;
-	double **angles, euler[3];
+ 	double **angles, euler[3];
 	// Octahedron symmetry preserving quaternions (24)
 	double q_oct[96];
 

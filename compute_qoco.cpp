@@ -14,20 +14,22 @@
 #include "fix_qrigid.h"
 /*--------------------------------------------------------------------------------*/
 // QOCO
+#include <fstream>
 #include <iostream>
 #include <vector>
-enum{CONSTANT,EQUAL,ATOM};
 /*--------------------------------------------------------------------------------*/
 using namespace LAMMPS_NS;
 
+enum{CONSTANT,EQUAL,ATOM};
 enum{ONCE,NFREQ,EVERY};
 enum{NONE,HARM,GAUSS};
+enum{EULER,QUAT,COORD};
 /* ---------------------------------------------------------------------- */
 ComputeQOCO::ComputeQOCO(LAMMPS *lmp, int narg, char **arg) :
   Compute(lmp, narg, arg),
-  maxbead(NULL), bead_axes(NULL), aor(NULL), alpha(NULL), angles(NULL),
-	m_prop(NULL), molone(NULL), molid(NULL), countone(NULL), countid(NULL),
-	map_bucket(NULL), m_id(NULL), thetac(NULL), idrigid(NULL),
+  aor(NULL), alpha(NULL), angles(NULL),
+	init_name(NULL), idrigid(NULL),
+	molid(NULL), map_bucket(NULL), m_id(NULL), thetac(NULL),
 	efrac(NULL), active(NULL), dquat(NULL),
 	k_vert(NULL), k_tors(NULL), alpha_eq(NULL),
 	kv_str(NULL), kt_str(NULL), ae_str(NULL),
@@ -36,7 +38,7 @@ ComputeQOCO::ComputeQOCO(LAMMPS *lmp, int narg, char **arg) :
 	/*--------------------------------------------------------------------------------*/
 {
 	// Implement different calculations for different types of molecules
-	// narg = (First 3) + (rigid=1) + (propname=1) + (qoco_num=1) + qoco_num * (parameters/m_id = 3)
+	// narg = (First 3) + (rigid=1) + (propname=2) + (qoco_num=1) + qoco_num * (parameters/m_id = 3)
  	/* ---------------------------------------------------------------------- */
 	// Get compute qoco ID: Groups atoms by rigid bodies;
 	// Must be defined for all atoms to which this is to be applied
@@ -48,25 +50,40 @@ ComputeQOCO::ComputeQOCO(LAMMPS *lmp, int narg, char **arg) :
 	// Get compute property/atom ID: Groups atoms by molecule type;
 	// Must be defined for all atoms to which this is to be applied
 	/* ---------------------------------------------------------------------- */
+	// Input filename
   n = strlen(arg[4]) + 1;
-  m_prop = new char[n];
-  strcpy(m_prop,arg[4]);
+  init_name = new char[n];
+  strcpy(init_name,arg[4]);
+	// Type of convention used for initial/reference rotation
+	if (strcmp(arg[5],"euler") == 0)	{
+		init_style = EULER;
+		init_str = "Euler";
+		init_cols = 3;
+	} else if (strcmp(arg[5],"quat") == 0)	{
+		init_style = QUAT;
+		init_str = "Quaternion";
+		init_cols = 4;
+	} else if (strcmp(arg[5],"coords") == 0)	{
+		init_style = COORD;
+		init_str = "Coordinates";
+		init_cols = 6;
+	} else error->all(FLERR,"Illegal compute qoco reference rotation type");
 	/* ---------------------------------------------------------------------- */
 	// Number of springs
-	qoco_num = force->inumeric(FLERR, arg[5]);
-	int iarg = 6+3*qoco_num;
+	qoco_num = force->inumeric(FLERR, arg[6]);
+	int iarg = 7+3*qoco_num;
 	if ( iarg > narg ) error->all(FLERR,"Illegal compute qoco command");
 	// Define parameter arrays on the heap
 	m_id = new int[qoco_num];
 	thetac = new double[qoco_num*2];
 
 	for (int i=0; i < qoco_num; ++i)		{
-		m_id[i] = force->inumeric(FLERR, arg[6+3*i]);
+		m_id[i] = force->inumeric(FLERR, arg[7+3*i]);
 		if (m_id[i] < 0) error->all(FLERR,"Illegal compute qoco command: negative m_id");
 		// Center point "coordinates" in degrees
-		thetac[i*2] = force->numeric(FLERR, arg[7+3*i]);
+		thetac[i*2] = force->numeric(FLERR, arg[8+3*i]);
 		thetac[i*2] = fmod(thetac[i*2], 180.0) * RAD;
-		thetac[i*2+1] = force->numeric(FLERR, arg[8+3*i]);
+		thetac[i*2+1] = force->numeric(FLERR, arg[9+3*i]);
 		thetac[i*2+1] = fmod(thetac[i*2+1], 360.0) * RAD;
 	}
 	// Optional arguments
@@ -178,15 +195,10 @@ ComputeQOCO::ComputeQOCO(LAMMPS *lmp, int narg, char **arg) :
 
 ComputeQOCO::~ComputeQOCO()
 {
-  memory->destroy(maxbead);
-  memory->destroy(bead_axes);
 	memory->destroy(alpha);
 	memory->destroy(aor);
   memory->destroy(angles);
-	memory->destroy(molone);
 	memory->destroy(molid);
-	memory->destroy(countone);
-	memory->destroy(countid);
 	memory->destroy(efrac);
 	memory->destroy(active);
 	memory->destroy(dquat);
@@ -194,7 +206,6 @@ ComputeQOCO::~ComputeQOCO()
   delete [] idrigid;
 	delete [] thetac;
 	delete [] m_id;
-	delete [] m_prop;
 	delete [] map_bucket;
 
 	//memory->destroy(qocoextra);
@@ -237,14 +248,6 @@ void ComputeQOCO::init()
 	if (fixrigid->reinitflag)
 		error->all(FLERR,"Rigid bodies reinitialized at every run command. Orientation error");
 	/* ---------------------------------------------------------------------- */
-	//Ensure that the property vector is defined in the input script and/or datafile
-	if (strstr(m_prop,"i_") == m_prop) {
-		int flag;
-		iprop = atom->find_custom(&m_prop[2],flag);
-		if (iprop < 0 || flag != 0)
-			error->all(FLERR,"Custom property/atom for molecule type does not exist");
-	}
-	/*--------------------------------------------------------------------------------*/
 	if (forceflag)	{
 		for (int m = 0; m < qoco_num; m++)		{
 			// Check for equal-style variables
@@ -470,19 +473,14 @@ inline void ComputeQOCO::init_compute()
 	firstflag = 0;
 	allocate();
 
-  int ibody,i,m;
-	double ec1[3],ec2[3],ec3[3],pproc[6][3], pall[6][3],qe0[4],qinv[4];
-
-	// Atom arrays
-	int *mask = atom->mask;
-	int nlocal = atom->nlocal;
-	tagint *tag = atom->tag;
-	int *m_type = atom->ivector[iprop];
+  int ibody,i,m,line_flag,idx;
+	double ec1[3],ec2[3],ec3[3],pproc[6][3], pall[6][3],qe0[4],qinv[4],tmp;
+	std::vector<double> vec;
   // extract body index[ibody] vector from fix qrigid
 	nbody = fixrigid->nbody;
   // ibody = 0 to nbody-1 for included atoms, -1 for excluded atoms
 	int *body = fixrigid->body;
-
+/* ---------------------------------------------------------------------- */
 	// Initialize the force/torque vector to zero
 	/*
 	for (m = 0; m < nbody; m++)	{
@@ -492,63 +490,79 @@ inline void ComputeQOCO::init_compute()
 	}
 	*/
 	// Even if the map_bucket variable points to a NULL variable at the first check
-	delete [] map_bucket;
-	for (m = 0; m < nbody; m++)	{
-		maxbead[m] = -1;
-		molone[m] = 0;
-		countone[m] = 0;
-	}
-	int	mindex = -1;
-	for (i = 0; i < nlocal; ++i)		{
-		if (mask[i] & groupbit) {
-			// ibody (0,nbody-1):location of molecule out of included ones for this compute
-			ibody = body[i];
-			if (ibody < 0)	continue;
-			maxbead[ibody] = MAX(tag[i], maxbead[ibody]);
-			// For map_bucket
-			mindex = MAX(mindex, m_type[i]);
-			// For molid per-body array
-			molone[ibody] += m_type[i];
-			countone[ibody]++;
+/* ---------------------------------------------------------------------- */
+	// Read reference rotation from input file
+	std::ifstream stream(init_name);
+	if (!stream) error->all(FLERR, "Cannot locate init file for rotation reference.");
+	std::string line;
+	// Locate header
+	line_flag = 0;
+	while (std::getline(stream, line))		{
+		if (line.find(init_str) != std::string::npos)	{
+			line_flag = 1;
+			// Found the required header: skip blank line and break
+			std::getline(stream, line);
+			break;
 		}
 	}
-	MPI_Allreduce(maxbead,bead_axes,nbody,MPI_LMP_TAGINT,MPI_MAX,world);
-	// Reduce per-atom molecule identity to per-body value
-	MPI_Allreduce(molone,molid,nbody,MPI_INT,MPI_SUM,world);
-	MPI_Allreduce(countone,countid,nbody,MPI_LMP_TAGINT,MPI_SUM,world);
-/* ---------------------------------------------------------------------- */
-	for (m = 0; m < nbody; m++)	{
-		if (molid[m]%countid[m] == 0)	molid[m] /= countid[m];
-		else	error->all(FLERR,"compute qoco: Incorrect moltype matches");	
-	}
-	// Catch number of molcule types in the system
-	MPI_Allreduce(&mindex,&m_max,1,MPI_INT,MPI_MAX,world);
-	// Molecule ID can start from 0; correspond to array index; m_max=len(array)
-	m_max += 1;
-	map_bucket = new int[m_max];
-	for (m=0; m<m_max; ++m) map_bucket[m] = -1;
-	// Store the index in the molcule type id number of map_bucket array
-	for (m=0; m<qoco_num; ++m) map_bucket[m_id[m]] = m;		
-/* ---------------------------------------------------------------------- */
+	if (line_flag==0)
+		error->all(FLERR,"Illegal compute qoco reference rotation: Style mismatch");
+	// Read and process data line-by-line until blank line
 	// Pre-save the quaternion of orientation difference
+	// Catch number of molcule types in the system
+	m_max = -1;
 	for (m = 0; m < nbody; m++)	{
-	/* ---------------------------------------------------------------------- */
-		// calculate position of each bead
-		for (i = 0; i < 6; i++) {
-			get_coords( (bead_axes[m]-5+i), pproc[i] );
+		// Ensure continuity in ibody number
+		stream >> idx;
+		if ( idx != (m+1) )
+			error->all(FLERR,"Illegal compute qoco reference rotation: Incorrect numbering");
+		// NP-type identity in second column
+		stream >> molid[m];
+		if (molid[m] < 0)
+			error->all(FLERR,"Illegal compute qoco reference rotation: MolID cannot be negative");
+		m_max = MAX(m_max, molid[m]);
+		// Remaining values based on input type
+		for (i = 0; i < init_cols; i++)		{
+			stream >> tmp;
+			vec.push_back(tmp);
 		}
-		MPI_Allreduce(&pproc[0][0],&pall[0][0],18,MPI_DOUBLE,MPI_SUM,world);
+		/* `---------------------------------------------------------------------- */
+		// INPUT: atom->TAG of each bead corresponding to {100} facet centers
+		if (init_style == COORD)		{
+			for (i = 0; i < 6; i++) {
+				get_coords( vec[i], pproc[i] );
+			}
+			MPI_Allreduce(&pproc[0][0],&pall[0][0],18,MPI_DOUBLE,MPI_SUM,world);
+			// Calculate principle axes x, y, z
+			unit(pall[0], pall[1], ec1);
+			unit(pall[2], pall[3], ec2);
+			unit(pall[4], pall[5], ec3);
+			MathExtra::exyz_to_q(ec1,ec2,ec3,qe0);
+		/*	---------------------------------------------------------------------- */
+		// INPUT: y-z'-z" Euler angle convention
+		} else if (init_style == EULER)		{
+			eul_to_axes(RAD*vec[0],RAD*vec[1],RAD*vec[2],ec1,ec2,ec3);
+			MathExtra::exyz_to_q(ec1,ec2,ec3,qe0);
+		/*	---------------------------------------------------------------------- */
+		// INPUT: Orientation quaternions
+		}	else	{
+			std::copy(vec.begin(), vec.end(), qe0); 
+		}
 		/* ---------------------------------------------------------------------- */
-		// Calculate principle axes x, y, z
-		unit(pall[0], pall[1], ec1);
-		unit(pall[2], pall[3], ec2);
-		unit(pall[4], pall[5], ec3);
 		//aquat(ec1, ec2, ec3, m); 
-		MathExtra::exyz_to_q(ec1,ec2,ec3,qe0);
 		quatinv(fixrigid->quat[m],qinv);
 		MathExtra::quatquat(qinv,qe0,dquat[m]);
 		MathExtra::qnormalize(dquat[m]);
-	}	
+		vec.clear();
+	}
+	stream.close();
+	// Molecule ID can start from 0; correspond to array index; m_max=len(array)
+	m_max += 1;
+	delete [] map_bucket;
+	map_bucket = new int[m_max];
+	for (m=0; m<m_max; ++m) map_bucket[m] = -1;
+	// Store the index in the molcule type id number of map_bucket array
+	for (m=0; m<qoco_num; ++m) map_bucket[m_id[m]] = m;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -706,13 +720,8 @@ int ComputeQOCO::lock_length()
 ------------------------------------------------------------------------- */
 void ComputeQOCO::allocate()
 {
-  memory->destroy(maxbead);
-  memory->destroy(bead_axes);
 	memory->destroy(alpha);
-	memory->destroy(molone);
 	memory->destroy(molid);
-	memory->destroy(countone);
-	memory->destroy(countid);
 	memory->destroy(aor);
   memory->destroy(angles);
 	memory->destroy(efrac);
@@ -720,13 +729,8 @@ void ComputeQOCO::allocate()
 	memory->destroy(dquat);
 	//memory->destroy(qocoextra);
 
-  memory->create(maxbead,nbody,"qoco:maxbead");
-  memory->create(bead_axes,nbody,"qoco:bead_axes");
   memory->create(alpha,nbody,"qoco:alpha");
-  memory->create(molone,nbody,"qoco:molone");
   memory->create(molid,nbody,"qoco:molid");
-  memory->create(countone,nbody,"qoco:countone");
-  memory->create(countid,nbody,"qoco:countid");
   memory->create(aor,nbody,3,"qoco:aor");
 	memory->create(efrac,nbody,"qoco:efrac");
 	memory->create(active,nbody,"qoco:active");
@@ -742,9 +746,8 @@ void ComputeQOCO::allocate()
 double ComputeQOCO::memory_usage()
 {
   double bytes = (bigint) nbody * 2 * sizeof(double);
-  bytes += (bigint) nbody * 2 * sizeof(tagint);
   bytes += (bigint) nbody * sizeof(double);
-  bytes += (bigint) nbody * 4 * sizeof(int);
+  bytes += (bigint) nbody  * sizeof(int);
   bytes += (bigint) nbody * 3 * sizeof(double);
   bytes += (bigint) nbody * 22 * sizeof(double);				// array
   bytes += (bigint) nbody * 2 * sizeof(double);
